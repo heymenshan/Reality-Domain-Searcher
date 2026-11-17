@@ -1,291 +1,365 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Automatic VPS TCP reachability monitor.
+
+Python 3.10+. Standard library only.
+No prompts, no external dependencies, English output.
+"""
+
 import argparse
 import csv
 import ipaddress
 import json
-import re
-import socket
-import statistics
-import subprocess
-import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
+import os
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-ROUNDS = 10
-TIMEOUT = 10
-MIN_SUCCESS = 0.90
+API = "https://check-host.net"
+DEFAULT_OUTPUT = Path("monitor_results.csv")
+MAX_POLLS = 10
+POLL_SECONDS = 3
 
-def public_ipv4():
-    req = urllib.request.Request(
-        "https://api.ipify.org",
-        headers={"User-Agent": "RealityNeighborScanner/1.0"}
+FIELDS = [
+    "checked_at",
+    "ip",
+    "port",
+    "node",
+    "country_code",
+    "country",
+    "city",
+    "status",
+    "latency_ms",
+    "error",
+    "verdict",
+]
+
+
+def api_json(url: str, timeout: int = 15) -> dict:
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "VPS-TCP-Monitor/2.1",
+        },
     )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return r.read().decode().strip()
+    with urlopen(req, timeout=timeout) as response:
+        return json.load(response)
 
-@lru_cache(maxsize=2048)
-def network_info(ip):
-    url = (
-        "https://stat.ripe.net/data/network-info/data.json?"
-        + urllib.parse.urlencode({
-            "resource": ip,
-            "sourceapp": "reality-neighbor-scanner"
-        })
-    )
-    with urllib.request.urlopen(url, timeout=10) as r:
-        data = json.load(r)["data"]
 
-    return {
-        "asns": {int(n) for n in data.get("asns", [])},
-        "prefix": data.get("prefix") or ""
-    }
+def validate_ip(ip: str) -> str:
+    address = ipaddress.IPv4Address(ip)
+    if not address.is_global:
+        raise ValueError("A public IPv4 address is required.")
+    return str(address)
 
-def resolve_ipv4(domain):
-    try:
-        return sorted({
-            info[4][0]
-            for info in socket.getaddrinfo(
-                domain, 443, family=socket.AF_INET,
-                type=socket.SOCK_STREAM
-            )
-        })
-    except (socket.gaierror, OSError):
-        return []
 
-def ptr_candidates(vps_ip):
-    # Passive reverse-DNS lookups within the VPS's /24.
-    network = ipaddress.ip_network(vps_ip + "/24", strict=False)
-    addresses = [str(ip) for ip in network.hosts()]
-
-    def lookup(ip):
-        try:
-            name = socket.gethostbyaddr(ip)[0].rstrip(".").lower()
-            return name if "." in name else None
-        except (OSError, socket.herror):
-            return None
-
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        return sorted({name for name in pool.map(lookup, addresses) if name})
-
-def tls_probe(domain, ip):
-    cmd = [
-        "openssl", "s_client",
-        "-connect", f"{ip}:443",
-        "-servername", domain,
-        "-verify_hostname", domain,
-        "-verify_return_error",
-        "-tls1_3",
-        "-alpn", "h2",
-        "-groups", "X25519",
-        "-brief"
+def detect_public_ip() -> str:
+    sources = [
+        "https://api.ipify.org?format=json",
+        "https://api4.ipify.org?format=json",
     ]
-    try:
-        result = subprocess.run(
-            cmd, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=TIMEOUT
-        )
-        out = result.stdout + result.stderr
-        checks = {
-            "tls13": bool(re.search(r"TLSv1\.3", out)),
-            "h2": bool(re.search(r"ALPN protocol:\s*h2\b", out, re.I)),
-            "x25519": bool(re.search(r"Server Temp Key:\s*X25519\b", out, re.I)),
-            "cert": bool(re.search(
-                r"(Verification:\s*OK|Verify return code:\s*0\s*\(ok\))",
-                out, re.I
-            )),
-        }
-        passed = result.returncode == 0 and all(checks.values())
-        return passed, checks
-    except (subprocess.TimeoutExpired, OSError):
-        return False, {}
 
-def http_probe(domain, ip):
-    cmd = [
-        "curl", "--noproxy", "*",
-        "-sS", "-L",
-        "--max-redirs", "0",
-        "--connect-timeout", "6",
-        "--max-time", str(TIMEOUT),
-        "--http2",
-        "--tlsv1.3", "--tls-max", "1.3",
-        "--resolve", f"{domain}:443:{ip}",
-        "-o", "/dev/null",
-        "-w", "%{http_code}|%{http_version}",
-        f"https://{domain}/"
-    ]
-    # Disable redirect following regardless of other curl defaults.
-    cmd.remove("-L")
-
-    try:
-        p = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=TIMEOUT + 2
-        )
-        code, version = p.stdout.strip().split("|", 1)
-        status = int(code)
-        return p.returncode == 0 and 200 <= status < 300 \
-            and version.startswith("2"), status
-    except (ValueError, OSError, subprocess.TimeoutExpired):
-        return False, 0
-
-def check_domain(domain, vps_info):
-    ips = resolve_ipv4(domain)
-    if not ips:
-        return None, "DNS 실패"
-
-    choices = []
-    for ip in ips:
+    for url in sources:
         try:
-            info = network_info(ip)
-        except Exception:
+            ip = api_json(url, timeout=8)["ip"]
+            return validate_ip(ip)
+        except (OSError, ValueError, KeyError, TypeError):
             continue
 
-        common = info["asns"] & vps_info["asns"]
-        if not common:
+    raise RuntimeError("Public IPv4 detection failed.")
+
+
+def select_nodes() -> tuple[dict, list[str]]:
+    data = api_json(f"{API}/nodes/hosts")
+    catalog = data.get("nodes", {})
+
+    if not isinstance(catalog, dict) or not catalog:
+        raise RuntimeError("No Check-Host nodes available.")
+
+    china = []
+    overseas = []
+
+    for node, metadata in catalog.items():
+        location = metadata.get("location", [])
+        if not location:
             continue
 
-        same_prefix = (
-            bool(vps_info["prefix"])
-            and ipaddress.ip_address(ip)
-            in ipaddress.ip_network(vps_info["prefix"], strict=False)
+        country_code = str(location[0]).upper()
+
+        if country_code == "CN":
+            china.append(node)
+        elif country_code not in {"HK", "MO", "TW"}:
+            overseas.append(node)
+
+    # Include up to 15 mainland-China nodes.
+    selected = china[:15]
+
+    # Add up to 10 geographically distinct overseas nodes.
+    seen_countries = set()
+    for node in overseas:
+        country_code = catalog[node]["location"][0].upper()
+        if country_code in seen_countries:
+            continue
+        seen_countries.add(country_code)
+        selected.append(node)
+        if len(selected) >= 25:
+            break
+
+    if not selected:
+        raise RuntimeError("No suitable checking nodes.")
+
+    return catalog, selected
+
+
+def start_check(ip: str, port: int, selected: list[str]) -> dict:
+    params = [
+        ("host", f"{ip}:{port}"),
+        ("max_nodes", str(len(selected))),
+    ]
+    params.extend(("node", node) for node in selected)
+
+    result = api_json(
+        f"{API}/check-tcp?{urlencode(params)}",
+        timeout=20,
+    )
+
+    if not result.get("ok") or not result.get("request_id"):
+        raise RuntimeError("Check-Host rejected the request.")
+
+    return result
+
+
+def parse_tcp(value) -> tuple[str, float | str, str]:
+    """Return (status, latency_ms, error) where status is PASS, FAIL, or PENDING."""
+    if not isinstance(value, list) or not value:
+        return "PENDING", "", ""
+
+    times = []
+    errors = []
+
+    for sample in value:
+        if not isinstance(sample, dict):
+            continue
+
+        if "error" in sample:
+            errors.append(str(sample["error"]))
+
+        elif isinstance(sample.get("time"), (int, float)):
+            latency = sample["time"]
+            if not isinstance(latency, bool) and latency >= 0:
+                times.append(float(latency) * 1000)
+
+    if errors:
+        return "FAIL", "", "; ".join(errors)
+
+    if times:
+        return "PASS", round(min(times), 2), ""
+
+    return "PENDING", "", ""
+
+
+def poll_results(request_id: str, nodes: dict) -> dict:
+    results = {}
+
+    for attempt in range(MAX_POLLS):
+        if attempt:
+            time.sleep(POLL_SECONDS)
+
+        response = api_json(f"{API}/check-result/{request_id}")
+
+        if isinstance(response, dict):
+            results.update(response)
+
+        completed = sum(
+            parse_tcp(results.get(node))[0] != "PENDING"
+            for node in nodes
         )
-        choices.append((not same_prefix, ip, info, same_prefix))
 
-    if not choices:
-        return None, "동일 ASN IP 없음"
+        print(
+            f"Checking: {completed}/{len(nodes)} "
+            f"(attempt {attempt + 1}/{MAX_POLLS})"
+        )
 
-    choices.sort()
+        if completed == len(nodes):
+            break
 
-    # Prefer a same-prefix IPv4 address if available.
-    _, ip, info, same_prefix = choices[0]
+    return results
 
-    latencies = []
-    failures = 0
 
-    for _ in range(ROUNDS):
-        start = __import__("time").perf_counter()
-        passed, checks = tls_probe(domain, ip)
-        elapsed = (__import__("time").perf_counter() - start) * 1000
-        if passed:
-            latencies.append(elapsed)
-        else:
-            failures += 1
+def make_rows(ip: str, port: int, nodes: dict, results: dict) -> list[dict]:
+    checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    rows = []
 
-    rate = len(latencies) / ROUNDS
-    if rate < MIN_SUCCESS:
-        return None, f"TLS 통과율 {rate:.0%}"
+    for node, metadata in nodes.items():
+        location = (
+            metadata
+            if isinstance(metadata, list)
+            else metadata.get("location", [])
+            if isinstance(metadata, dict)
+            else []
+        )
 
-    http_ok, status = http_probe(domain, ip)
-    if not http_ok:
-        return None, f"HTTP 미통과 (상태 {status})"
+        country_code = str(location[0]).upper() if len(location) > 0 else "UNKNOWN"
+        country = str(location[1]) if len(location) > 1 else ""
+        city = str(location[2]) if len(location) > 2 else node
 
-    return {
-        "domain": domain,
-        "ip": ip,
-        "asn": ",".join(str(n) for n in sorted(info["asns"])),
-        "same_prefix": same_prefix,
-        "success_rate": f"{rate:.0%}",
-        "median_tls_ms": round(statistics.median(latencies), 1),
-        "http_status": status,
-        "target": domain + ":443",
-        "sni": domain,
-    }, "PASS"
+        status, latency, error = parse_tcp(results.get(node))
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--ip", help="VPS public IPv4; auto-detect if omitted"
+        rows.append({
+            "checked_at": checked_at,
+            "ip": ip,
+            "port": port,
+            "node": node,
+            "country_code": country_code,
+            "country": country,
+            "city": city,
+            "status": status,
+            "latency_ms": latency,
+            "error": error,
+        })
+
+    return rows
+
+
+def assess(rows: list[dict]) -> str:
+    china = [row for row in rows if row["country_code"] == "CN"]
+    overseas = [
+        row for row in rows
+        if row["country_code"] not in {"CN", "HK", "MO", "TW", "UNKNOWN"}
+    ]
+
+    if not china:
+        return "CHINA UNKNOWN"
+
+    china_fail = any(row["status"] == "FAIL" for row in china)
+    china_pass = any(row["status"] == "PASS" for row in china)
+    overseas_pass = any(row["status"] == "PASS" for row in overseas)
+    overseas_fail = any(row["status"] == "FAIL" for row in overseas)
+
+    if china_fail and overseas_pass:
+        return "BLOCKED SUSPECTED"
+
+    if china_fail:
+        return "CHINA FAILURE - VERIFY SERVER"
+
+    if china_pass and overseas_pass:
+        if overseas_fail:
+            return "PARTIAL CONNECTIVITY"
+        return "REACHABLE"
+
+    if china_pass:
+        return "CHINA REACHABLE - OVERSEAS UNKNOWN"
+
+    return "UNKNOWN"
+
+
+def save_csv(rows: list[dict], verdict: str, output_path: Path) -> None:
+    write_header = not output_path.exists() or output_path.stat().st_size == 0
+
+    with output_path.open("a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=FIELDS)
+
+        if write_header:
+            writer.writeheader()
+
+        for row in rows:
+            writer.writerow({**row, "verdict": verdict})
+
+
+def print_report(rows: list[dict], verdict: str, link: str, output_path: Path) -> None:
+    print()
+    print("=" * 72)
+    print(f"{'CODE':<6} {'COUNTRY / CITY':<34} {'STATUS':<10} {'LATENCY':>10}")
+    print("-" * 72)
+
+    for row in rows:
+        location = f"{row['country']} - {row['city']}".strip(" -") or row["node"]
+        latency = f"{row['latency_ms']} ms" if row["latency_ms"] != "" else "-"
+
+        print(
+            f"{row['country_code']:<6} "
+            f"{location[:34]:<34} "
+            f"{row['status']:<10} "
+            f"{latency:>10}"
+        )
+
+    china_count = sum(row["country_code"] == "CN" for row in rows)
+
+    print("=" * 72)
+    print(f"CHINA NODES : {china_count}")
+    print(f"TOTAL NODES : {len(rows)}")
+    print(f"VERDICT     : {verdict}")
+    print(f"REPORT      : {link or 'N/A'}")
+    print(f"CSV         : {output_path.resolve()}")
+
+    if not china_count:
+        print("NOTE: No mainland China test nodes were available.")
+
+    print("NOTE: TCP reachability does not verify VLESS-Reality handshakes.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Automatic VPS TCP Reachability Monitor"
     )
     parser.add_argument(
-        "--discover-ptr", action="store_true",
-        help="Add PTR-derived names from the local /24"
+        "--ip",
+        default=os.getenv("TARGET_IP"),
+        help="Public IPv4 (default: automatic detection)",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("TARGET_PORT", "443")),
+        help="TCP port (default: 443)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(os.getenv("OUTPUT_CSV", DEFAULT_OUTPUT)),
+        help=f"Output CSV path (default: {DEFAULT_OUTPUT})",
+    )
+
     args = parser.parse_args()
 
-    vps_ip = args.ip or public_ipv4()
-    vps_info = network_info(vps_ip)
+    if not 1 <= args.port <= 65535:
+        parser.error("Port must be between 1 and 65535.")
 
-    if not vps_info["asns"]:
-        raise SystemExit("VPS ASN을 확인할 수 없습니다.")
+    try:
+        ip = validate_ip(args.ip) if args.ip else detect_public_ip()
 
-    print(f"VPS: {vps_ip}")
-    print(f"ASN: {sorted(vps_info['asns'])}")
-    print(f"BGP prefix: {vps_info['prefix']}")
+        print("=" * 55)
+        print("AUTOMATIC VPS TCP REACHABILITY MONITOR")
+        print("=" * 55)
+        print(f"Target : {ip}:{args.port}")
+        print("Mode   : Automatic")
+        print("Service: Check-Host")
+        print()
 
-    candidate_file = Path("candidates.txt")
-    if not candidate_file.exists():
-        candidate_file.write_text(
-            "# One candidate hostname per line\n",
-            encoding="utf-8"
-        )
+        _, selected = select_nodes()
+        check = start_check(ip, args.port, selected)
 
-    domains = {
-        line.strip().lower()
-        for line in candidate_file.read_text(
-            encoding="utf-8"
-        ).splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    }
+        actual_nodes = check.get("nodes", {})
+        if not actual_nodes:
+            raise RuntimeError("No nodes assigned to check.")
 
-    if args.discover_ptr:
-        print("PTR 도메인 후보 탐색 중...")
-        domains.update(ptr_candidates(vps_ip))
+        results = poll_results(check["request_id"], actual_nodes)
+        rows = make_rows(ip, args.port, actual_nodes, results)
+        verdict = assess(rows)
 
-    domains = sorted(
-        d for d in domains
-        if re.fullmatch(
-            r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", d
-        ) and "." in d and len(d) <= 253
-    )
+        save_csv(rows, verdict, args.output)
+        print_report(rows, verdict, check.get("permanent_link", ""), args.output)
 
-    print(f"후보 도메인: {len(domains)}개\n")
+        return 0
 
-    results = []
-    for i, domain in enumerate(domains, 1):
-        try:
-            result, reason = check_domain(domain, vps_info)
-        except Exception as exc:
-            result, reason = None, str(exc)[:90]
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
-        if result:
-            results.append(result)
-            print(
-                f"[{i}/{len(domains)}] PASS {domain} "
-                f"{result['median_tls_ms']}ms "
-                f"same-prefix={result['same_prefix']}"
-            )
-        else:
-            print(f"[{i}/{len(domains)}] FAIL {domain}: {reason}")
-
-    results.sort(
-        key=lambda x: (
-            not x["same_prefix"],
-            x["median_tls_ms"]
-        )
-    )
-
-    fields = [
-        "domain", "ip", "asn", "same_prefix",
-        "success_rate", "median_tls_ms",
-        "http_status", "target", "sni"
-    ]
-
-    with open("results.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(results)
-
-    print("\n========== 통과한 도메인 ==========")
-    for i, r in enumerate(results, 1):
-        print(
-            f"{i}. {r['domain']} | {r['ip']} | "
-            f"{r['median_tls_ms']}ms | "
-            f"same-prefix={r['same_prefix']}"
-        )
-
-    print(f"\n통과: {len(results)}개 / {len(domains)}개")
-    print("결과 저장: results.csv")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
