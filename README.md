@@ -1,57 +1,29 @@
 # Reality Domain Searcher
 
-A Python tool for Reality SNI analysis and VPS TCP connectivity monitoring.
-
-## Features
-
-- Automatic VPS public IP detection
-- ASN and BGP network analysis
-- Reality SNI candidate validation
-- TLS 1.3, HTTP/2, X25519 and certificate checks
-- Global TCP connectivity testing via Check-Host
-- Mainland China blocking assessment when test nodes are available
-- CSV result export
-- English output
-
-## Installation
+Run on the VPS where you plan to use REALITY. Python 3.10+ with TLS 1.3 support is required.
 
 ```bash
 git clone https://github.com/heymenshan/Reality-Domain-Searcher.git
 cd Reality-Domain-Searcher
-```
-
-## Usage
-
-Run directly on your VPS:
-
-```bash
 python3 scanner.py
 ```
 
-Specify a VPS IP:
+The default scan takes up to 1,000 candidates from Tranco. It checks whether each candidate negotiates TLS 1.3 and HTTP/2 with a trusted certificate for the hostname. It prints up to 50 passing domains, ranked by TCP connection time from the VPS to port 443. Each row also shows the tested IP and its ICMP ping. A dash means the system ping command was unavailable or no ICMP reply was received. The search prints results in the terminal.
 
 ```bash
-python3 scanner.py --ip YOUR_VPS_IP
-```
-
-View available options:
-
-```bash
+python3 scanner.py --top 50 --limit 3000
+python3 scanner.py --domains domains.txt
 python3 scanner.py --help
 ```
 
-## Results
+A local candidate file may contain one hostname per line or `rank,hostname` CSV rows. All measurements are from the VPS. Candidate checks cover TLS 1.3, certificate validation and HTTP/2. REALITY client connectivity, X25519, OCSP and mainland-China reachability require separate verification.
 
-- `REACHABLE` — TCP connection successful
-- `BLOCKED SUSPECTED` — Mainland China connection failure while overseas connectivity succeeds
-- `CHINA UNKNOWN` — No mainland China test nodes available
-- `UNKNOWN` — Insufficient test data
+## VPS port monitoring
 
-Results are exported to CSV files.
+The Check-Host monitor checks inbound TCP reachability to the VPS and writes a CSV report. Mainland-China results depend on node availability.
 
-## Notes
-
-- Python 3.10+ required.
-- Mainland China test nodes may not be available.
-- TCP connectivity does not guarantee VLESS-Reality connectivity.
-- The latest changes must be committed and pushed to GitHub before cloning or updating the repository on another VPS.
+```bash
+python3 scanner.py monitor
+python3 scanner.py monitor --ip YOUR_VPS_IP --port 443
+python3 scanner.py monitor --help
+```
