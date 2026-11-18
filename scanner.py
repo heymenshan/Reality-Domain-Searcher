@@ -22,7 +22,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 API = "https://check-host.net"
@@ -439,6 +439,67 @@ def icmp_ping(address):
     return "-"
 
 
+
+GLOBALPING = "https://api.globalping.io/v1/measurements"
+
+
+def china_https(domain):
+    # 仅接受中国大陆探针返回的有效 HTTPS 响应。
+    payload = {
+        "type": "http",
+        "target": domain,
+        "locations": [{"country": "CN"}],
+        "limit": 3,
+        "measurementOptions": {
+            "protocol": "HTTPS",
+            "port": 443,
+            "request": {"method": "HEAD", "path": "/"},
+        },
+    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    token = os.getenv("GLOBALPING_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        request = Request(GLOBALPING, data=json.dumps(payload).encode(), headers=headers)
+        with urlopen(request, timeout=10) as response:
+            measurement = json.load(response)
+        url = f"{GLOBALPING}/{quote(measurement['id'], safe='')}"
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            with urlopen(Request(url, headers=headers), timeout=8) as response:
+                measurement = json.load(response)
+            if measurement.get("status") == "finished":
+                break
+        else:
+            return "", "measurement timed out"
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return "", str(exc)
+
+    mainland = 0
+    successes = []
+    for entry in measurement.get("results", []):
+        probe = entry.get("probe") or {}
+        if probe.get("country") != "CN":
+            continue
+        mainland += 1
+        result = entry.get("result") or {}
+        if result.get("status") != "finished":
+            continue
+        code = result.get("statusCode")
+        if code is None:
+            match = re.search(r"(?m)^HTTP/\S+\s+(\d{3})\b", result.get("rawOutput") or "")
+            code = int(match[1]) if match else None
+        if str(code).isdigit() and 200 <= int(code) < 400:
+            successes.append(f"{probe.get('city') or 'CN'} {code}")
+    if not mainland:
+        return "", "no mainland China probes"
+    if not successes:
+        return "", "no successful HTTPS response"
+    return ", ".join(dict.fromkeys(successes)), ""
+
+
 def scan_main(argv):
     parser = argparse.ArgumentParser(description="Rank REALITY domain candidates from this VPS.")
     parser.add_argument("--top", type=int, default=50, help="Maximum results (default: 50)")
@@ -474,14 +535,30 @@ def scan_main(argv):
             if checked % 100 == 0 or checked == len(domains):
                 print(f"Checked {checked}/{len(domains)}; passed {len(matches)}.", file=sys.stderr, flush=True)
         ranked = sorted(matches, key=lambda row: (row[2], row[0]))[:args.top]
-        pings = list(pool.map(icmp_ping, (row[1] for row in ranked)))
+    if not ranked:
+        print("No VPS candidates passed TLS checks.", file=sys.stderr)
+        return 1
 
-    print(f"{'#':>3}  {'DOMAIN':<36} {'TCP 443 (ms)':>12} {'PING (ms)':>10}  IP")
-    for rank, ((domain, address, tcp_ms), ping_ms) in enumerate(zip(ranked, pings), 1):
-        print(f"{rank:>3}  {domain:<36} {tcp_ms:>12.1f} {ping_ms:>10}  {address}")
-    if len(ranked) < args.top:
-        print(f"Found {len(ranked)} of {args.top} requested results. Increase --limit or provide --domains.", file=sys.stderr)
-    return 0 if ranked else 1
+    print(f"Checking the top {len(ranked)} candidates from mainland China via Globalping HTTPS...",
+          file=sys.stderr, flush=True)
+    confirmed = []
+    with ThreadPoolExecutor(max_workers=min(args.workers, 5)) as pool:
+        pending = {pool.submit(china_https, row[0]): row for row in ranked}
+        for future in as_completed(pending):
+            row = pending[future]
+            evidence, error = future.result()
+            if evidence:
+                confirmed.append((row, evidence))
+            else:
+                print(f"{row[0]}: {error}", file=sys.stderr)
+        confirmed.sort(key=lambda entry: (entry[0][2], entry[0][0]))
+        pings = list(pool.map(icmp_ping, (row[1] for row, _ in confirmed)))
+
+    print(f"{'#':>3}  {'DOMAIN':<36} {'TCP 443 (ms)':>12} {'PING (ms)':>10}  {'IP':<39} CHINA HTTPS")
+    for rank, (((domain, address, tcp_ms), evidence), ping_ms) in enumerate(zip(confirmed, pings), 1):
+        print(f"{rank:>3}  {domain:<36} {tcp_ms:>12.1f} {ping_ms:>10}  {address:<39} {evidence}")
+    print(f"Confirmed {len(confirmed)} of {len(ranked)} candidates from mainland China.", file=sys.stderr)
+    return 0 if confirmed else 1
 
 
 def main():
