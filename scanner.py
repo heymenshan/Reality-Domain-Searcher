@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Automatic VPS TCP reachability monitor.
+"""REALITY domain search and optional VPS TCP reachability monitor.
 
 Python 3.10+. Standard library only.
 No prompts, no external dependencies, English output.
@@ -8,11 +8,18 @@ No prompts, no external dependencies, English output.
 
 import argparse
 import csv
+import io
 import ipaddress
 import json
 import os
+import re
+import socket
+import ssl
+import subprocess
 import sys
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -302,7 +309,7 @@ def print_report(rows: list[dict], verdict: str, link: str, output_path: Path) -
     print("NOTE: TCP reachability does not verify VLESS-Reality handshakes.")
 
 
-def main() -> int:
+def monitor_main(argv) -> int:
     parser = argparse.ArgumentParser(
         description="Automatic VPS TCP Reachability Monitor"
     )
@@ -324,7 +331,7 @@ def main() -> int:
         help=f"Output CSV path (default: {DEFAULT_OUTPUT})",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not 1 <= args.port <= 65535:
         parser.error("Port must be between 1 and 65535.")
@@ -359,6 +366,132 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+
+
+TRANCO_URL = "https://tranco-list.eu/top-1m.csv.zip"
+DOMAIN_PATTERN = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def domain_candidates(source, limit):
+    # 读取本地候选名单，或使用最新的 Tranco 排名。
+    if source is None:
+        request = Request(TRANCO_URL, headers={"User-Agent": "Reality-Domain-Searcher/3.0"})
+        with urlopen(request, timeout=20) as response:
+            archive = io.BytesIO(response.read(32 * 1024 * 1024 + 1))
+        if archive.getbuffer().nbytes > 32 * 1024 * 1024:
+            raise ValueError("Downloaded domain list exceeded 32 MiB.")
+        with zipfile.ZipFile(archive) as ranked, ranked.open("top-1m.csv") as entries:
+            return read_domains(io.TextIOWrapper(entries, encoding="utf-8-sig"), limit)
+    with source.open(encoding="utf-8-sig", newline="") as entries:
+        return read_domains(entries, limit)
+
+
+def read_domains(entries, limit):
+    domains = {}
+    for row in csv.reader(entries):
+        if not row:
+            continue
+        name = row[-1].strip().lower().rstrip(".")
+        if len(name) <= 253 and DOMAIN_PATTERN.fullmatch(name):
+            domains.setdefault(name, None)
+            if len(domains) == limit:
+                break
+    return list(domains)
+
+
+def probe_domain(domain, context, timeout):
+    # 分开记录 TCP 建连时间，DNS 和 TLS 握手时间不计入。
+    try:
+        addresses = socket.getaddrinfo(domain, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        return None
+    for family, kind, protocol, _, address in addresses[:4]:
+        if not ipaddress.ip_address(address[0]).is_global:
+            continue
+        try:
+            with socket.socket(family, kind, protocol) as connection:
+                connection.settimeout(timeout)
+                started = time.monotonic()
+                connection.connect(address)
+                tcp_ms = (time.monotonic() - started) * 1000
+                with context.wrap_socket(connection, server_hostname=domain) as tls:
+                    if tls.selected_alpn_protocol() == "h2":
+                        return domain, address[0], tcp_ms
+        except OSError:
+            continue
+    return None
+
+
+def icmp_ping(address):
+    command = "ping6" if ":" in address and sys.platform == "darwin" else "ping"
+    try:
+        result = subprocess.run(
+            [command, "-n", "-c", "1", address], capture_output=True,
+            text=True, timeout=2, env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "-"
+    match = re.search(r"time([=<])\s*(\d+(?:\.\d+)?)\s*ms", result.stdout)
+    if match:
+        prefix = "<" if match[1] == "<" else ""
+        return f"{prefix}{match[2]}"
+    return "-"
+
+
+def scan_main(argv):
+    parser = argparse.ArgumentParser(description="Rank REALITY domain candidates from this VPS.")
+    parser.add_argument("--top", type=int, default=50, help="Maximum results (default: 50)")
+    parser.add_argument("--limit", type=int, default=1000, help="Candidate limit (default: 1000)")
+    parser.add_argument("--workers", type=int, default=24, help="Parallel probes (default: 24)")
+    parser.add_argument("--timeout", type=float, default=2.0, help="TCP/TLS socket timeout in seconds")
+    parser.add_argument("--domains", type=Path, help="Local list, one hostname per line or rank,hostname CSV")
+    args = parser.parse_args(argv)
+    if args.top < 1 or args.limit < 1 or not 1 <= args.workers <= 64 or not 0 < args.timeout <= 30:
+        parser.error("Use positive --top and --limit, 1–64 workers, and a timeout of 0–30 seconds.")
+
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.set_alpn_protocols(["h2"])
+    print(f"Loading candidates from {args.domains or 'Tranco'}...", file=sys.stderr, flush=True)
+    try:
+        domains = domain_candidates(args.domains, args.limit)
+    except (OSError, ValueError, KeyError, csv.Error, zipfile.BadZipFile) as exc:
+        print(f"Could not load candidates: {exc}", file=sys.stderr)
+        return 1
+    if not domains:
+        print("No domain candidates found.", file=sys.stderr)
+        return 1
+
+    print(f"Checking {len(domains)} domains for trusted TLS 1.3 and h2...", file=sys.stderr, flush=True)
+    matches = []
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        pending = [pool.submit(probe_domain, domain, context, args.timeout) for domain in domains]
+        for checked, future in enumerate(as_completed(pending), 1):
+            result = future.result()
+            if result:
+                matches.append(result)
+            if checked % 100 == 0 or checked == len(domains):
+                print(f"Checked {checked}/{len(domains)}; passed {len(matches)}.", file=sys.stderr, flush=True)
+        ranked = sorted(matches, key=lambda row: (row[2], row[0]))[:args.top]
+        pings = list(pool.map(icmp_ping, (row[1] for row in ranked)))
+
+    print(f"{'#':>3}  {'DOMAIN':<36} {'TCP 443 (ms)':>12} {'PING (ms)':>10}  IP")
+    for rank, ((domain, address, tcp_ms), ping_ms) in enumerate(zip(ranked, pings), 1):
+        print(f"{rank:>3}  {domain:<36} {tcp_ms:>12.1f} {ping_ms:>10}  {address}")
+    if len(ranked) < args.top:
+        print(f"Found {len(ranked)} of {args.top} requested results. Increase --limit or provide --domains.", file=sys.stderr)
+    return 0 if ranked else 1
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] == "monitor":
+        return monitor_main(argv[1:])
+    legacy_flags = {"--ip", "--port", "--output"}
+    if any(arg.split("=", 1)[0] in legacy_flags for arg in argv):
+        return monitor_main(argv)
+    return scan_main(argv)
 
 
 if __name__ == "__main__":
