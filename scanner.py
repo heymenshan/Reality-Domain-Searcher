@@ -554,10 +554,25 @@ def scan_main(argv):
         confirmed.sort(key=lambda entry: (entry[0][2], entry[0][0]))
         pings = list(pool.map(icmp_ping, (row[1] for row, _ in confirmed)))
 
-    print(f"{'#':>3}  {'DOMAIN':<36} {'TCP 443 (ms)':>12} {'PING (ms)':>10}  {'IP':<39} CHINA HTTPS")
-    for rank, (((domain, address, tcp_ms), evidence), ping_ms) in enumerate(zip(confirmed, pings), 1):
-        print(f"{rank:>3}  {domain:<36} {tcp_ms:>12.1f} {ping_ms:>10}  {address:<39} {evidence}")
-    print(f"Confirmed {len(confirmed)} of {len(ranked)} candidates from mainland China.", file=sys.stderr)
+    print(f"\nMainland China HTTPS | {len(confirmed)}/{len(ranked)} confirmed")
+    if confirmed:
+        domain_width = max(len("DOMAIN"), max(len(row[0]) for row, _ in confirmed))
+        ip_width = max(len("IP"), max(len(row[1]) for row, _ in confirmed))
+        header = (f"{'#':>3}  {'DOMAIN':<{domain_width}}  {'TCP 443':>7}  "
+                  f"{'PING':>7}  {'IP':<{ip_width}}  CHINA HTTPS")
+        print("VPS latency in ms")
+        print(header)
+        print("-" * len(header))
+        for rank, (((domain, address, tcp_ms), evidence), ping_ms) in enumerate(zip(confirmed, pings), 1):
+            cities_by_status = {}
+            for response in evidence.split(", "):
+                city, status = response.rsplit(" ", 1)
+                cities_by_status.setdefault(status, []).append(city)
+            china = " | ".join(
+                f"{status} {'/'.join(cities)}" for status, cities in sorted(cities_by_status.items())
+            )
+            print(f"{rank:>3}  {domain:<{domain_width}}  {tcp_ms:>7.1f}  "
+                  f"{ping_ms:>7}  {address:<{ip_width}}  {china}")
     return 0 if confirmed else 1
 
 
